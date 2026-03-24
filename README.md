@@ -8,7 +8,7 @@ A hands-on guide to building distributed applications with Daml smart contracts 
 
 This book teaches developers with blockchain experience how to build applications using Daml and Canton. It covers everything from writing your first smart contract to deploying on the Canton Network in production.
 
-- **256 pages** across 26 chapters in 5 parts
+- **242 pages** across 26 chapters in 5 parts
 - **Both Java and JavaScript** backend examples
 - **50+ passing Daml tests** across 12 runnable projects
 - **Complete code examples** included — no copy-paste from PDFs needed
