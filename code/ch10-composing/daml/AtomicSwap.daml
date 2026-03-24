@@ -1,0 +1,180 @@
+module AtomicSwap where
+
+import Daml.Script
+import DA.Assert
+
+-- The Asset Template
+template Asset
+  with
+    issuer   : Party
+    owner    : Party
+    symbol   : Text
+    quantity : Decimal
+    observers : [Party]
+  where
+    signatory issuer, owner
+    observer observers
+    ensure quantity > 0.0
+
+    choice Split : (ContractId Asset, ContractId Asset)
+      with
+        splitQuantity : Decimal
+      controller owner
+      do
+        assertMsg "Split quantity must be positive"
+          (splitQuantity > 0.0)
+        assertMsg "Split quantity must be less than total"
+          (splitQuantity < quantity)
+        cid1 <- create this with
+          quantity = splitQuantity
+        cid2 <- create this with
+          quantity = quantity - splitQuantity
+        return (cid1, cid2)
+
+    choice Merge : ContractId Asset
+      with
+        otherCid : ContractId Asset
+      controller owner
+      do
+        other <- fetch otherCid
+        assertMsg "Cannot merge: issuer mismatch"
+          (other.issuer == issuer)
+        assertMsg "Cannot merge: owner mismatch"
+          (other.owner == owner)
+        assertMsg "Cannot merge: symbol mismatch"
+          (other.symbol == symbol)
+        archive otherCid
+        create this with
+          quantity = quantity + other.quantity
+
+    choice Transfer : ContractId Asset
+      with
+        newOwner : Party
+      controller owner, newOwner
+      do
+        assertMsg "New owner must differ from current"
+          (newOwner /= owner)
+        create this with
+          owner = newOwner
+          observers = []
+
+    choice SplitAndTransfer
+      : (ContractId Asset, ContractId Asset)
+      with
+        amount : Decimal
+        newOwner : Party
+      controller owner, newOwner
+      do
+        -- Step 1: Split the asset
+        (splitCid, remainCid) <- exercise self Split
+          with splitQuantity = amount
+        -- Step 2: Transfer the split portion
+        transferredCid <- exercise splitCid Transfer
+          with newOwner
+        return (transferredCid, remainCid)
+
+-- Trade Proposal Template
+template TradeProposal
+  with
+    proposer    : Party
+    counterparty : Party
+    offeredCid  : ContractId Asset
+    offeredSymbol : Text
+    offeredQty  : Decimal
+    requestedSymbol : Text
+    requestedQty   : Decimal
+  where
+    signatory proposer
+    observer counterparty
+
+    choice TradeProposal_Cancel
+      : ()
+      controller proposer
+      do return ()
+
+    choice TradeProposal_Accept
+      : (ContractId Asset, ContractId Asset)
+      with
+        counterpartyCid : ContractId Asset
+      controller counterparty
+      do
+        -- Verify the offered asset
+        offered <- fetch offeredCid
+        assertMsg "Offered asset: wrong proposer"
+          (offered.owner == proposer)
+        assertMsg "Offered asset: wrong symbol"
+          (offered.symbol == offeredSymbol)
+        assertMsg "Offered asset: insufficient qty"
+          (offered.quantity >= offeredQty)
+
+        -- Verify the counterparty's asset
+        counter <- fetch counterpartyCid
+        assertMsg "Counter asset: wrong owner"
+          (counter.owner == counterparty)
+        assertMsg "Counter asset: wrong symbol"
+          (counter.symbol == requestedSymbol)
+        assertMsg "Counter asset: wrong qty"
+          (counter.quantity >= requestedQty)
+
+        -- Atomic swap: transfer both
+        newForCounterparty <- exercise offeredCid
+          Transfer with newOwner = counterparty
+        newForProposer <- exercise counterpartyCid
+          Transfer with newOwner = proposer
+
+        return (newForCounterparty, newForProposer)
+
+-- Test helpers
+setup : Script (Party, Party, Party)
+setup = do
+  bank <- allocateParty "Bank"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  return (bank, alice, bob)
+
+test_atomic_swap = do
+  (bank, alice, bob) <- setup
+
+  -- Bank issues USD to Alice (Bob is observer)
+  let bankAlice = actAs bank <> actAs alice
+  aliceUsd <- submit bankAlice do
+    createCmd Asset with
+      issuer = bank
+      owner = alice
+      symbol = "USD"
+      quantity = 100.0
+      observers = [bob]
+
+  -- Bank issues EUR to Bob (Alice is observer)
+  let bankBob = actAs bank <> actAs bob
+  bobEur <- submit bankBob do
+    createCmd Asset with
+      issuer = bank
+      owner = bob
+      symbol = "EUR"
+      quantity = 85.0
+      observers = [alice]
+
+  -- Alice proposes: 100 USD for 85 EUR
+  proposal <- submit alice do
+    createCmd TradeProposal with
+      proposer = alice
+      counterparty = bob
+      offeredCid = aliceUsd
+      offeredSymbol = "USD"
+      offeredQty = 100.0
+      requestedSymbol = "EUR"
+      requestedQty = 85.0
+
+  -- Bob accepts, providing his EUR asset
+  (bobGotUsd, aliceGotEur) <- submit bob do
+    exerciseCmd proposal TradeProposal_Accept
+      with counterpartyCid = bobEur
+
+  -- Verify: Bob now has USD, Alice has EUR
+  Some usd <- queryContractId bob bobGotUsd
+  assertMsg "Bob should have 100 USD"
+    (usd.quantity == 100.0)
+  Some eur <- queryContractId alice aliceGotEur
+  assertMsg "Alice should have 85 EUR"
+    (eur.quantity == 85.0)

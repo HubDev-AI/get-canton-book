@@ -1,0 +1,10 @@
+sdk-version: 3.4.11
+name: asset-test
+source: daml
+version: 1.0.0
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+data-dependencies:
+  - ../asset-lib/.daml/dist/asset-lib-1.0.0.dar

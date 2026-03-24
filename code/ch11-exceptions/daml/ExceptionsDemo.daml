@@ -1,0 +1,223 @@
+module ExceptionsDemo where
+
+import Daml.Script
+import DA.Fail
+import DA.TextMap (fromList)
+import DA.Action (when)
+
+-- | Account template with ensure invariant
+template Account
+  with
+    bank    : Party
+    owner   : Party
+    name    : Text
+    balance : Decimal
+  where
+    signatory bank, owner
+    ensure balance >= 0.0
+      && name /= ""
+
+    -- | Deposit with assertMsg validation
+    choice Deposit : ContractId Account
+      with
+        amount : Decimal
+        source : Text
+      controller bank
+      do
+        assertMsg "Amount must be positive"
+          (amount > 0.0)
+        assertMsg "Exceeds deposit limit"
+          (amount <= 1000000.0)
+        assertMsg "Source must not be empty"
+          (source /= "")
+        create this with
+          balance = balance + amount
+
+    -- | Withdraw with failWithStatus
+    choice Withdraw : ContractId Account
+      with
+        amount : Decimal
+      controller owner
+      do
+        when (amount <= 0.0) do
+          failWithStatus FailureStatus with
+            errorId =
+              "myapp/invalid-amount"
+            category = invalidArgument
+            message =
+              "Amount must be positive"
+            meta = fromList
+              [("amount", show amount)]
+        when (amount > balance) do
+          failWithStatus FailureStatus with
+            errorId =
+              "myapp/insufficient-funds"
+            category = failedPrecondition
+            message =
+              "Insufficient balance"
+            meta = fromList
+              [ ("balance"
+                , show balance)
+              , ("requested"
+                , show amount)
+              ]
+        create this with
+          balance = balance - amount
+
+    -- | Process with abort for dead-end
+    choice Process : ContractId Account
+      with
+        action : Text
+      controller owner
+      do
+        case action of
+          "deposit" -> create this with
+            balance = balance + 10.0
+          "withdraw" -> create this with
+            balance = balance - 10.0
+          _ -> abort
+            ("Unknown action: " <> action)
+
+    -- | Transfer with validate-then-act
+    choice Transfer : ContractId Account
+      with
+        amount : Decimal
+        recipientName : Text
+      controller owner
+      do
+        when (amount <= 0.0) do
+          failWithStatus FailureStatus with
+            errorId =
+              "myapp/invalid-amount"
+            category = invalidArgument
+            message =
+              "Amount must be positive"
+            meta = fromList
+              [("amount", show amount)]
+        when (recipientName == "") do
+          failWithStatus FailureStatus with
+            errorId =
+              "myapp/empty-recipient"
+            category = invalidArgument
+            message =
+              "Recipient required"
+            meta = fromList []
+        when (amount > balance) do
+          failWithStatus FailureStatus with
+            errorId =
+              "myapp/insufficient-funds"
+            category = failedPrecondition
+            message =
+              "Insufficient balance"
+            meta = fromList
+              [ ("balance"
+                , show balance)
+              , ("requested"
+                , show amount)
+              ]
+        create this with
+          balance = balance - amount
+
+-- | Reusable validation helpers
+requirePositive
+  : Text -> Decimal -> Update ()
+requirePositive label val =
+  when (val <= 0.0) do
+    failWithStatus FailureStatus with
+      errorId =
+        "myapp/non-positive-value"
+      category = invalidArgument
+      message =
+        label <> " must be positive"
+      meta = fromList
+        [ ("field", label)
+        , ("value", show val)
+        ]
+
+requireNonEmpty
+  : Text -> Text -> Update ()
+requireNonEmpty label val =
+  when (val == "") do
+    failWithStatus FailureStatus with
+      errorId = "myapp/empty-field"
+      category = invalidArgument
+      message =
+        label <> " must not be empty"
+      meta = fromList
+        [("field", label)]
+
+-- | Pure validation helper
+validatePositive : Text -> Decimal -> Decimal
+validatePositive field val
+  | val > 0.0 = val
+  | otherwise =
+      failWithStatusPure FailureStatus with
+        errorId =
+          "myapp/non-positive-value"
+        category = invalidArgument
+        message =
+          field <> " must be positive"
+        meta = fromList
+          [ ("field", field)
+          , ("value", show val)
+          ]
+
+-- Tests
+
+test_ensure_rejects_negative = do
+  bank <- allocateParty "Bank"
+  alice <- allocateParty "Alice"
+  submitMustFail bank do
+    createCmd Account with
+      bank
+      owner = alice
+      name = "Savings"
+      balance = -10.0
+
+test_failWithStatus_bad_amount = do
+  bank <- allocateParty "Bank"
+  alice <- allocateParty "Alice"
+  let parties = actAs bank <> actAs alice
+  cid <- submit parties do
+    createCmd Account with
+      bank
+      owner = alice
+      name = "Savings"
+      balance = 50.0
+  -- Zero amount triggers invalidArgument
+  submitMustFail alice do
+    exerciseCmd cid Withdraw
+      with amount = 0.0
+
+test_failWithStatus_overdraw = do
+  bank <- allocateParty "Bank"
+  alice <- allocateParty "Alice"
+  let parties = actAs bank <> actAs alice
+  cid <- submit parties do
+    createCmd Account with
+      bank
+      owner = alice
+      name = "Savings"
+      balance = 50.0
+  -- Overdraw triggers failedPrecondition
+  submitMustFail alice do
+    exerciseCmd cid Withdraw
+      with amount = 100.0
+
+test_successful_withdraw = do
+  bank <- allocateParty "Bank"
+  alice <- allocateParty "Alice"
+  let parties = actAs bank <> actAs alice
+  cid <- submit parties do
+    createCmd Account with
+      bank
+      owner = alice
+      name = "Savings"
+      balance = 50.0
+  cid2 <- submit alice do
+    exerciseCmd cid Withdraw
+      with amount = 25.0
+  -- Only 25.0 left; 30.0 should fail
+  submitMustFail alice do
+    exerciseCmd cid2 Withdraw
+      with amount = 30.0

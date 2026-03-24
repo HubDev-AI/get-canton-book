@@ -1,0 +1,56 @@
+module AssetTest where
+
+import Daml.Script
+import DA.Optional (isNone)
+import Asset
+
+data Parties = Parties with
+  bank : Party
+  alice : Party
+  bob : Party
+
+setupParties : Script Parties
+setupParties = do
+  bank <- allocateParty "Bank"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  return Parties with ..
+
+issueAsset : Party -> Party -> Text
+  -> Decimal -> Script (ContractId Asset)
+issueAsset issuer owner symbol qty = do
+  let parties = actAs issuer <> actAs owner
+  submit parties do
+    createCmd Asset with
+      issuer; owner; symbol
+      quantity = qty
+      observers = []
+
+test_create = do
+  Parties{..} <- setupParties
+  cid <- issueAsset bank alice "USD" 100.0
+  Some a <- queryContractId alice cid
+  assertMsg "Qty" (a.quantity == 100.0)
+
+test_split = do
+  Parties{..} <- setupParties
+  cid <- issueAsset bank alice "USD" 100.0
+  (c1, c2) <- submit alice do
+    exerciseCmd cid Split
+      with splitQuantity = 40.0
+  Some a1 <- queryContractId alice c1
+  Some a2 <- queryContractId alice c2
+  assertMsg "Piece 1" (a1.quantity == 40.0)
+  assertMsg "Piece 2" (a2.quantity == 60.0)
+
+test_transfer = do
+  Parties{..} <- setupParties
+  cid <- issueAsset bank alice "USD" 100.0
+  let parties = actAs alice <> actAs bob
+  newCid <- submit parties do
+    exerciseCmd cid Transfer
+      with newOwner = bob
+  Some a <- queryContractId bob newCid
+  assertMsg "Owner" (a.owner == bob)
+  old <- queryContractId alice cid
+  assertMsg "Archived" (isNone old)

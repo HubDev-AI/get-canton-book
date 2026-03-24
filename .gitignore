@@ -1,0 +1,22 @@
+# Daml build artifacts
+.daml/
+
+# Node modules
+node_modules/
+dist/
+.env
+
+# Java build artifacts
+build/
+.gradle/
+*.class
+*.jar
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp

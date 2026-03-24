@@ -1,0 +1,211 @@
+module TestSuite where
+
+import Daml.Script
+import DA.Optional (isNone, isSome)
+
+-- Asset template (from ch10, needed for tests)
+template Asset
+  with
+    issuer   : Party
+    owner    : Party
+    symbol   : Text
+    quantity : Decimal
+    observers : [Party]
+  where
+    signatory issuer, owner
+    observer observers
+    ensure quantity > 0.0
+
+    choice Split
+      : (ContractId Asset, ContractId Asset)
+      with splitQuantity : Decimal
+      controller owner
+      do
+        assertMsg "Split qty must be positive"
+          (splitQuantity > 0.0)
+        assertMsg "Split qty must be less than total"
+          (splitQuantity < quantity)
+        cid1 <- create this with
+          quantity = splitQuantity
+        cid2 <- create this with
+          quantity = quantity - splitQuantity
+        return (cid1, cid2)
+
+    choice Merge : ContractId Asset
+      with otherCid : ContractId Asset
+      controller owner
+      do
+        other <- fetch otherCid
+        assertMsg "Issuer mismatch"
+          (other.issuer == issuer)
+        assertMsg "Owner mismatch"
+          (other.owner == owner)
+        assertMsg "Symbol mismatch"
+          (other.symbol == symbol)
+        archive otherCid
+        create this with
+          quantity = quantity + other.quantity
+
+    choice Transfer : ContractId Asset
+      with newOwner : Party
+      controller owner, newOwner
+      do
+        assertMsg "New owner must differ"
+          (newOwner /= owner)
+        create this with
+          owner = newOwner
+          observers = []
+
+-- Agreement template (for submit/actAs tests)
+template Agreement
+  with
+    partyA : Party
+    partyB : Party
+    terms : Text
+  where
+    signatory partyA, partyB
+
+-- Token template (for simple tests)
+template Token
+  with
+    owner : Party
+  where
+    signatory owner
+
+-- Test helpers
+data Parties = Parties with
+  bank : Party
+  alice : Party
+  bob : Party
+
+setupParties : Script Parties
+setupParties = do
+  bank <- allocateParty "Bank"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  return Parties with ..
+
+issueAsset : Party -> Party -> Text
+  -> Decimal -> Script (ContractId Asset)
+issueAsset issuer owner symbol qty = do
+  let parties = actAs issuer <> actAs owner
+  submit parties do
+    createCmd Asset with
+      issuer
+      owner
+      symbol
+      quantity = qty
+      observers = []
+
+-- Creation Tests
+test_create_asset = do
+  Parties{..} <- setupParties
+  cid <- issueAsset bank alice "USD" 100.0
+  Some asset <- queryContractId alice cid
+  assertMsg "Issuer" (asset.issuer == bank)
+  assertMsg "Owner" (asset.owner == alice)
+  assertMsg "Symbol" (asset.symbol == "USD")
+  assertMsg "Qty" (asset.quantity == 100.0)
+
+test_create_zero_fails = do
+  Parties{..} <- setupParties
+  submitMustFail bank do
+    createCmd Asset with
+      issuer = bank
+      owner = bank
+      symbol = "USD"
+      quantity = 0.0
+      observers = []
+
+test_create_negative_fails = do
+  Parties{..} <- setupParties
+  submitMustFail bank do
+    createCmd Asset with
+      issuer = bank
+      owner = bank
+      symbol = "USD"
+      quantity = -50.0
+      observers = []
+
+-- Split Tests
+test_split = do
+  Parties{..} <- setupParties
+  cid <- issueAsset bank alice "USD" 100.0
+  (cid1, cid2) <- submit alice do
+    exerciseCmd cid Split with splitQuantity = 40.0
+  Some a1 <- queryContractId alice cid1
+  Some a2 <- queryContractId alice cid2
+  assertMsg "Split piece 1" (a1.quantity == 40.0)
+  assertMsg "Split piece 2" (a2.quantity == 60.0)
+  -- Original is archived
+  old <- queryContractId alice cid
+  assertMsg "Original archived" (isNone old)
+
+test_split_zero_fails = do
+  Parties{..} <- setupParties
+  cid <- issueAsset bank alice "USD" 100.0
+  submitMustFail alice do
+    exerciseCmd cid Split with splitQuantity = 0.0
+
+test_split_full_amount_fails = do
+  Parties{..} <- setupParties
+  cid <- issueAsset bank alice "USD" 100.0
+  submitMustFail alice do
+    exerciseCmd cid Split
+      with splitQuantity = 100.0
+
+-- Merge Tests
+test_merge = do
+  Parties{..} <- setupParties
+  cid1 <- issueAsset bank alice "USD" 60.0
+  cid2 <- issueAsset bank alice "EUR" 40.0
+  -- Cannot merge different symbols
+  submitMustFail alice do
+    exerciseCmd cid1 Merge with otherCid = cid2
+
+test_merge_same_symbol = do
+  Parties{..} <- setupParties
+  cid <- issueAsset bank alice "USD" 100.0
+  (cid1, cid2) <- submit alice do
+    exerciseCmd cid Split with splitQuantity = 40.0
+  merged <- submit alice do
+    exerciseCmd cid1 Merge with otherCid = cid2
+  Some m <- queryContractId alice merged
+  assertMsg "Merged quantity" (m.quantity == 100.0)
+
+-- Transfer Tests
+test_transfer = do
+  Parties{..} <- setupParties
+  cid <- issueAsset bank alice "USD" 100.0
+  let parties = actAs alice <> actAs bob
+  newCid <- submit parties do
+    exerciseCmd cid Transfer with newOwner = bob
+  Some asset <- queryContractId bob newCid
+  assertMsg "New owner is Bob"
+    (asset.owner == bob)
+  -- Alice can no longer see it
+  old <- queryContractId alice cid
+  assertMsg "Old contract archived" (isNone old)
+
+test_transfer_to_self_fails = do
+  Parties{..} <- setupParties
+  cid <- issueAsset bank alice "USD" 100.0
+  submitMustFail alice do
+    exerciseCmd cid Transfer
+      with newOwner = alice
+
+-- Field Lookup Tests
+test_field_lookup = do
+  Parties{..} <- setupParties
+  _cid <- issueAsset bank alice "USD" 100.0
+  results <- queryFilter @Asset bank
+    (\a -> a.owner == alice && a.symbol == "USD")
+  assertMsg "Should find 1 asset"
+    (length results == 1)
+
+test_field_not_found = do
+  Parties{..} <- setupParties
+  results <- queryFilter @Asset bank
+    (\a -> a.owner == alice && a.symbol == "GBP")
+  assertMsg "GBP should not exist"
+    (null results)

@@ -1,0 +1,55 @@
+module SimpleAsset where
+
+import Daml.Script
+
+template Asset
+  with
+    issuer : Party
+    owner : Party
+    symbol : Text
+    quantity : Decimal
+    observers : [Party]
+  where
+    signatory issuer, owner
+    observer observers
+    ensure quantity > 0.0
+
+    choice Transfer : ContractId Asset
+      with newOwner : Party
+      controller owner, newOwner
+      do create this with
+           owner = newOwner
+           observers = []
+
+test_asset = do
+  bank <- allocateParty "Bank"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  -- Create an asset (bank is sole owner initially)
+  cid <- submit bank do
+    createCmd Asset with
+      issuer = bank
+      owner = bank
+      symbol = "USD"
+      quantity = 100.0
+      observers = [alice]
+
+  -- Transfer to Alice (both must authorize)
+  let parties = actAs bank <> actAs alice
+  aliceCid <- submit parties do
+    exerciseCmd cid Transfer with newOwner = alice
+
+  -- Verify the transfer
+  Some asset <- queryContractId alice aliceCid
+  assert (asset.owner == alice)
+  assert (asset.quantity == 100.0)
+
+  -- Look up by contract ID
+  result <- queryContractId bank cid
+  assert (result == None)  -- original is archived
+
+  -- Query all assets visible to Alice
+  assets <- queryFilter @Asset alice
+    (\a -> a.symbol == "USD")
+  assert (length assets == 1)

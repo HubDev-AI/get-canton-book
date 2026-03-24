@@ -1,0 +1,132 @@
+module Main where
+
+import Daml.Script
+
+-- Type aliases for readability
+type Symbol = Text
+type Amount = Decimal
+
+-- Account status as a variant
+data Status
+  = Active
+  | Frozen
+  | Closed
+    deriving (Eq, Show)
+
+-- Token metadata with optional fields
+data TokenInfo = TokenInfo with
+    symbol : Symbol
+    name : Text
+    decimals : Int
+    website : Optional Text
+  deriving (Eq, Show)
+
+-- The registry contract
+template TokenRegistry
+  with
+    admin : Party
+    info : TokenInfo
+    status : Status
+    holders : [Party]
+  where
+    signatory admin
+    observer holders
+
+    ensure info.decimals >= 0
+      && info.decimals <= 18
+
+    -- Freeze the token (admin only)
+    choice Freeze : ContractId TokenRegistry
+      controller admin
+      do
+        assertMsg "Can only freeze Active tokens"
+          (status == Active)
+        create this with status = Frozen
+
+    -- Unfreeze back to Active
+    choice Unfreeze : ContractId TokenRegistry
+      controller admin
+      do
+        assertMsg "Can only unfreeze Frozen tokens"
+          (status == Frozen)
+        create this with status = Active
+
+    -- Close permanently
+    choice CloseToken : ContractId TokenRegistry
+      controller admin
+      do
+        assertMsg "Cannot close: already Closed"
+          (status /= Closed)
+        create this with
+          status = Closed
+          holders = []
+
+    -- Add an observer
+    nonconsuming choice AddHolder
+      : ContractId TokenRegistry
+      with
+        newHolder : Party
+      controller admin
+      do
+        assertMsg "Token must be Active"
+          (status == Active)
+        assertMsg "Already a holder"
+          (notElem newHolder holders)
+        archive self
+        create this with
+          holders = newHolder :: holders
+
+test_registry : Script ()
+test_registry = do
+  admin <- allocateParty "Admin"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  -- Create a token registry entry
+  regCid <- submit admin do
+    createCmd TokenRegistry with
+      admin
+      status = Active
+      holders = []
+      info = TokenInfo with
+        symbol = "ACME"
+        name = "Acme Corp Token"
+        decimals = 8
+        website = Some "https://acme.example.com"
+
+  -- Add holders
+  regCid <- submit admin do
+    exerciseCmd regCid AddHolder with
+      newHolder = alice
+  regCid <- submit admin do
+    exerciseCmd regCid AddHolder with
+      newHolder = bob
+
+  -- Freeze the token
+  regCid <- submit admin do
+    exerciseCmd regCid Freeze
+
+  -- Cannot add holders while frozen
+  submitMustFail admin do
+    exerciseCmd regCid AddHolder with
+      newHolder = alice
+
+  -- Unfreeze and close
+  regCid <- submit admin do
+    exerciseCmd regCid Unfreeze
+  submit admin do
+    exerciseCmd regCid CloseToken
+
+  -- Verify: create a minimal token (no optional fields)
+  submit admin do
+    createCmd TokenRegistry with
+      admin
+      status = Active
+      holders = []
+      info = TokenInfo with
+        symbol = "BETA"
+        name = "Beta Token"
+        decimals = 0
+        website = None
+
+  pure ()

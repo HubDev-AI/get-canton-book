@@ -1,0 +1,399 @@
+module AuthLab where
+
+import Daml.Script
+
+-- A simple contract: one signatory
+template Note
+  with
+    writer : Party
+    text : Text
+  where
+    signatory writer
+
+-- Two signatories: both must agree
+template Agreement
+  with
+    partyA : Party
+    partyB : Party
+    terms : Text
+  where
+    signatory partyA, partyB
+    observer partyA, partyB
+
+-- A proposal for an agreement (single signatory)
+template AgreementProposal
+  with
+    proposer : Party
+    accepter : Party
+    terms : Text
+  where
+    signatory proposer
+    observer accepter
+
+    choice Accept : ContractId Agreement
+      controller accepter
+      do
+        create Agreement with
+          partyA = proposer
+          partyB = accepter
+          terms
+
+    choice Reject : ()
+      controller accepter
+      do pure ()
+
+    choice Withdraw : ()
+      controller proposer
+      do pure ()
+
+-- A contract that delegates creation authority
+template Delegator
+  with
+    owner : Party
+    delegate : Party
+  where
+    signatory owner
+    observer delegate
+
+    choice CreateOnBehalf : ContractId Note
+      with
+        noteText : Text
+      controller delegate
+      do
+        -- This creates a Note with owner as signatory.
+        -- Authority comes from:
+        --   (1) delegate (submitter / controller)
+        --   (2) owner (signatory of Delegator
+        --       being consumed)
+        create Note with
+          writer = owner
+          text = noteText
+
+-- A contract with a nonconsuming choice
+template Vault
+  with
+    owner : Party
+    guardian : Party
+  where
+    signatory owner
+    observer guardian
+
+    -- Nonconsuming: the Vault is NOT archived
+    nonconsuming choice Peek : Text
+      controller guardian
+      do pure "Vault contents"
+
+    -- Consuming: the Vault IS archived
+    choice Open : Text
+      controller guardian
+      do pure "Vault opened"
+
+-- Try to use a Vault to create a Note as owner
+template VaultExploit
+  with
+    attacker : Party
+    vaultCid : ContractId Vault
+  where
+    signatory attacker
+
+    choice TryExploit : ContractId Note
+      controller attacker
+      do
+        -- Exercise a nonconsuming choice on the Vault.
+        -- The Vault is NOT consumed, so owner's
+        -- authority is NOT released.
+        exercise vaultCid Peek
+        -- Now try to create a Note as the vault owner.
+        -- This WILL FAIL: we never got owner's authority.
+        vault <- fetch vaultCid
+        create Note with
+          writer = vault.owner
+          text = "Forged by attacker"
+
+-- WRONG: Alice tries to give Bob a gift
+template Gift
+  with
+    giver : Party
+    receiver : Party
+    item : Text
+  where
+    signatory giver, receiver  -- Both must agree!
+
+template GiftOffer
+  with
+    giver : Party
+    receiver : Party
+    item : Text
+  where
+    signatory giver
+    observer receiver
+
+    choice AcceptGift : ContractId Gift
+      controller receiver
+      do
+        create Gift with giver, receiver, item
+
+    choice DeclineGift : ()
+      controller receiver
+      do pure ()
+
+template Bulletin
+  with
+    poster : Party
+    readers : [Party]
+    message : Text
+  where
+    signatory poster
+    observer readers
+
+    nonconsuming choice ViewMessage : Text
+      with
+        viewer : Party
+      controller viewer
+      do
+        assertMsg "Not a reader"
+          (viewer `elem` readers || viewer == poster)
+        pure message
+
+template Secret
+  with
+    owner : Party
+    content : Text
+  where
+    signatory owner
+    -- No observers!
+
+    choice Reveal : ContractId Secret
+      with
+        viewer : Party
+      controller owner
+      do
+        create this
+
+-- Test 1: Cannot Create Without All Signatories
+test_create_auth : Script ()
+test_create_auth = do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  -- FAIL: Alice tries to create an Agreement
+  --       where Bob is also a signatory.
+  --       Bob has not authorized this.
+  submitMustFail alice do
+    createCmd Agreement with
+      partyA = alice
+      partyB = bob
+      terms = "Alice wrote this without Bob"
+
+  -- OK: Alice can create a Note (she is sole signatory)
+  submit alice do
+    createCmd Note with
+      writer = alice
+      text = "Alice's note"
+
+  pure ()
+
+-- Test 2: Cannot Exercise Without Controller Authority
+test_exercise_auth : Script ()
+test_exercise_auth = do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+
+  -- Alice proposes an agreement to Bob
+  propCid <- submit alice do
+    createCmd AgreementProposal with
+      proposer = alice
+      accepter = bob
+      terms = "Partnership deal"
+
+  -- FAIL: Charlie tries to accept Bob's proposal.
+  --       Charlie is not the controller.
+  submitMustFail charlie do
+    exerciseCmd propCid Accept
+
+  -- FAIL: Alice tries to accept her own proposal.
+  --       Alice is the proposer, not the accepter.
+  submitMustFail alice do
+    exerciseCmd propCid Accept
+
+  -- OK: Bob accepts (he is the controller)
+  submit bob do
+    exerciseCmd propCid Accept
+
+  pure ()
+
+-- Test 3: Cannot Archive Without Signatory Authority
+test_archive_auth : Script ()
+test_archive_auth = do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  -- Create a single-signatory Note
+  noteCid <- submit alice do
+    createCmd Note with
+      writer = alice
+      text = "My note"
+
+  -- FAIL: Bob tries to archive Alice's Note.
+  --       Bob is not a signatory.
+  submitMustFail bob do
+    archiveCmd noteCid
+
+  -- OK: Alice archives her own Note
+  submit alice do
+    archiveCmd noteCid
+
+  -- Create a dual-signatory Agreement via proposal
+  propCid <- submit alice do
+    createCmd AgreementProposal with
+      proposer = alice
+      accepter = bob
+      terms = "Joint venture"
+  agrCid <- submit bob do
+    exerciseCmd propCid Accept
+
+  -- FAIL: Alice alone cannot archive a dual-signatory
+  -- contract. All signatories must authorize.
+  submitMustFail alice do
+    archiveCmd agrCid
+
+  -- OK: Both signatories together can archive
+  let parties = actAs alice <> actAs bob
+  submit parties do
+    archiveCmd agrCid
+
+  pure ()
+
+-- Test 4: Authority Flows Through Exercise Chains
+test_authority_flow : Script ()
+test_authority_flow = do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  -- Alice creates a Delegator, giving Bob
+  -- the ability to create Notes as Alice
+  delCid <- submit alice do
+    createCmd Delegator with
+      owner = alice
+      delegate = bob
+
+  -- Bob exercises CreateOnBehalf.
+  -- The Delegator is consumed, contributing
+  -- Alice's authority. Combined with Bob's
+  -- authority as submitter, the Note creation
+  -- succeeds.
+  submit bob do
+    exerciseCmd delCid CreateOnBehalf with
+      noteText = "Written by Bob, signed by Alice"
+
+  pure ()
+
+-- Test 5: No Authority Laundering
+test_no_laundering : Script ()
+test_no_laundering = do
+  alice <- allocateParty "Alice"
+  mallory <- allocateParty "Mallory"
+
+  -- Alice creates a Vault with Mallory as guardian
+  vaultCid <- submit alice do
+    createCmd Vault with
+      owner = alice
+      guardian = mallory
+
+  -- Mallory creates an exploit contract
+  exploitCid <- submit mallory do
+    createCmd VaultExploit with
+      attacker = mallory
+      vaultCid = vaultCid
+
+  -- FAIL: The exploit cannot forge Alice's authority.
+  -- Peeking at the Vault (nonconsuming) does NOT
+  -- release Alice's signatory authority.
+  submitMustFail mallory do
+    exerciseCmd exploitCid TryExploit
+
+  -- Even with a consuming choice, the authority
+  -- only flows within that choice's sub-transaction.
+  -- It does not leak to sibling operations.
+
+  pure ()
+
+-- Test 6: Common Pitfalls
+test_gift_pitfall : Script ()
+test_gift_pitfall = do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  -- FAIL: Alice cannot make Bob a signatory
+  --       without his consent
+  submitMustFail alice do
+    createCmd Gift with
+      giver = alice
+      receiver = bob
+      item = "A book"
+
+  pure ()
+
+test_gift_fixed : Script ()
+test_gift_fixed = do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  -- Alice offers the gift
+  offerCid <- submit alice do
+    createCmd GiftOffer with
+      giver = alice
+      receiver = bob
+      item = "A book"
+
+  -- Bob accepts
+  submit bob do
+    exerciseCmd offerCid AcceptGift
+
+  pure ()
+
+test_observer_limits : Script ()
+test_observer_limits = do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  bCid <- submit alice do
+    createCmd Bulletin with
+      poster = alice
+      readers = [bob]
+      message = "Hello world"
+
+  -- Bob can read (nonconsuming, no authority needed)
+  msg <- submit bob do
+    exerciseCmd bCid ViewMessage with viewer = bob
+  assertMsg "Should see message" (msg == "Hello world")
+
+  -- FAIL: Bob cannot archive Alice's Bulletin.
+  -- Archiving requires Alice's authority (signatory).
+  submitMustFail bob do
+    archiveCmd bCid
+
+  -- OK: Alice (the signatory) can archive
+  submit alice do
+    archiveCmd bCid
+
+  pure ()
+
+test_visibility_pitfall : Script ()
+test_visibility_pitfall = do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  secretCid <- submit alice do
+    createCmd Secret with
+      owner = alice
+      content = "Top secret"
+
+  -- Bob cannot see or act on this contract at all.
+  -- queryContractId returns None for non-stakeholders.
+  result <- queryContractId @Secret bob secretCid
+  assertMsg "Bob should not see the secret"
+    (result == None)
+
+  pure ()

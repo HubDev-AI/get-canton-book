@@ -1,0 +1,108 @@
+module Test.LicenseTest where
+
+import Daml.Script
+import DA.Time
+import DA.Optional (isNone)
+import Main.License
+
+data Parties = Parties with
+  vendor   : Party
+  customer : Party
+
+setup : Script Parties
+setup = do
+  vendor <- allocateParty "Acme"
+  customer <- allocateParty "Alice"
+  return Parties with ..
+
+test_create_license = do
+  Parties{..} <- setup
+  now <- getTime
+  let expiry = addRelTime now (days 365)
+  cid <- submit vendor do
+    createCmd License with
+      vendor
+      customer
+      product = "Enterprise Suite"
+      issuedAt = now
+      expiresAt = expiry
+  Some lic <- queryContractId vendor cid
+  assertMsg "Product"
+    (lic.product == "Enterprise Suite")
+  assertMsg "Customer"
+    (lic.customer == customer)
+
+test_renew_license = do
+  Parties{..} <- setup
+  now <- getTime
+  let expiry = addRelTime now (days 365)
+  let newExp = addRelTime now (days 730)
+  cid <- submit vendor do
+    createCmd License with
+      vendor; customer
+      product = "Enterprise Suite"
+      issuedAt = now
+      expiresAt = expiry
+  newCid <- submit vendor do
+    exerciseCmd cid Renew with
+      newExpiry = newExp
+  Some lic <- queryContractId vendor newCid
+  assertMsg "Extended"
+    (lic.expiresAt == newExp)
+  -- Old contract archived
+  old <- queryContractId vendor cid
+  assertMsg "Archived" (isNone old)
+
+test_revoke_license = do
+  Parties{..} <- setup
+  now <- getTime
+  let expiry = addRelTime now (days 365)
+  cid <- submit vendor do
+    createCmd License with
+      vendor; customer
+      product = "Enterprise Suite"
+      issuedAt = now
+      expiresAt = expiry
+  submit vendor do
+    exerciseCmd cid Revoke
+  old <- queryContractId vendor cid
+  assertMsg "Revoked" (isNone old)
+
+test_request_renewal = do
+  Parties{..} <- setup
+  now <- getTime
+  let expiry = addRelTime now (days 365)
+  let reqExp = addRelTime now (days 730)
+  cid <- submit vendor do
+    createCmd License with
+      vendor; customer
+      product = "Enterprise Suite"
+      issuedAt = now
+      expiresAt = expiry
+  -- Customer requests renewal
+  reqCid <- submit customer do
+    exerciseCmd cid RequestRenewal with
+      requestedExpiry = reqExp
+      reason = "Need extended support"
+  -- Vendor approves
+  newLicCid <- submit vendor do
+    exerciseCmd reqCid ApproveRenewal
+  Some lic <- queryContractId vendor newLicCid
+  assertMsg "Renewed"
+    (lic.expiresAt == reqExp)
+
+test_cannot_shorten_license = do
+  Parties{..} <- setup
+  now <- getTime
+  let expiry = addRelTime now (days 365)
+  let shorter = addRelTime now (days 100)
+  cid <- submit vendor do
+    createCmd License with
+      vendor; customer
+      product = "Enterprise Suite"
+      issuedAt = now
+      expiresAt = expiry
+  -- Cannot renew to earlier date
+  submitMustFail vendor do
+    exerciseCmd cid Renew with
+      newExpiry = shorter

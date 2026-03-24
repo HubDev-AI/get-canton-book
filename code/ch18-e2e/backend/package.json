@@ -1,0 +1,15 @@
+{
+  "name": "ch18-license-backend",
+  "version": "1.0.0",
+  "description": "License management backend for Canton (Book Chapter 18)",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "dotenv": "^16.4.5"
+  }
+}

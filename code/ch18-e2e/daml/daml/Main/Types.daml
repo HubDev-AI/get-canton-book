@@ -1,0 +1,7 @@
+module Main.Types where
+
+data LicenseStatus
+  = Active
+  | Expired
+  | Revoked
+  deriving (Eq, Show)

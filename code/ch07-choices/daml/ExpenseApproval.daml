@@ -1,0 +1,285 @@
+module ExpenseApproval where
+
+import Daml.Script
+
+data Category
+  = Travel
+  | Meals
+  | Equipment
+  | Software
+  | Other
+    deriving (Eq, Show)
+
+data ExpenseStatus
+  = Pending
+  | Approved
+  | Rejected
+  | NeedsInfo
+    deriving (Eq, Show)
+
+data LineItem = LineItem with
+    description : Text
+    amount : Decimal
+    category : Category
+  deriving (Eq, Show)
+
+template ExpenseReport
+  with
+    employee : Party
+    manager : Party
+    finance : Party
+    title : Text
+    items : [LineItem]
+    status : ExpenseStatus
+    notes : Text
+  where
+    signatory employee
+    observer manager, finance
+
+    -- Only valid with at least one item
+    ensure not (null items)
+
+    -- Manager approves the expense
+    choice Approve : ContractId ExpenseReport
+      controller manager
+      do
+        assertMsg "Can only approve Pending reports"
+          (status == Pending)
+        create this with
+          status = Approved
+          notes = "Approved by manager"
+
+    -- Manager rejects the expense
+    choice Reject : ContractId ExpenseReport
+      with
+        reason : Text
+      controller manager
+      do
+        assertMsg "Can only reject Pending reports"
+          (status == Pending)
+        create this with
+          status = Rejected
+          notes = reason
+
+    -- Manager requests more information
+    choice RequestInfo : ContractId ExpenseReport
+      with
+        question : Text
+      controller manager
+      do
+        assertMsg "Can only request info on Pending"
+          (status == Pending)
+        create this with
+          status = NeedsInfo
+          notes = question
+
+    -- Employee responds to info request
+    choice ProvideInfo : ContractId ExpenseReport
+      with
+        response : Text
+      controller employee
+      do
+        assertMsg "Can only respond to NeedsInfo"
+          (status == NeedsInfo)
+        create this with
+          status = Pending
+          notes = response
+
+    -- Calculate total (read-only, no state change)
+    nonconsuming choice GetTotal : Decimal
+      controller employee
+      do
+        pure (foldl (\acc i -> acc + i.amount) 0.0 items)
+
+    -- Any party in a list can add a comment
+    nonconsuming choice AddComment : ContractId Comment
+      with
+        commenter : Party
+        body : Text
+      controller commenter
+      do
+        assertMsg "Not authorized to comment"
+          (commenter == employee
+            || commenter == manager
+            || commenter == finance)
+        create Comment with
+          report = self
+          author = commenter
+          body
+
+-- Supporting template for comments
+template Comment
+  with
+    report : ContractId ExpenseReport
+    author : Party
+    body : Text
+  where
+    signatory author
+
+-- A payment record created after final approval
+template Payment
+  with
+    payer : Party
+    payee : Party
+    amount : Decimal
+    reference : Text
+  where
+    signatory payer
+    observer payee
+
+-- Final approval with payment creation
+template ApprovedExpense
+  with
+    employee : Party
+    manager : Party
+    finance : Party
+    title : Text
+    totalAmount : Decimal
+  where
+    signatory employee, manager
+    observer finance
+
+    -- Finance issues payment (return type is a tuple)
+    choice IssuePayment
+      : (ContractId Payment, Decimal)
+      controller finance
+      do
+        let pmtRef = "EXP-" <> title
+        pmtCid <- create Payment with
+          payer = finance
+          payee = employee
+          amount = totalAmount
+          reference = pmtRef
+        pure (pmtCid, totalAmount)
+
+-- Manager approval that auto-creates ApprovedExpense
+template ExpenseWorkflow
+  with
+    employee : Party
+    manager : Party
+    finance : Party
+    reportCid : ContractId ExpenseReport
+  where
+    signatory employee
+    observer manager
+
+    choice ManagerApprove
+      : ContractId ApprovedExpense
+      with
+        approvedTotal : Decimal
+      controller manager
+      do
+        -- Archive the original report
+        exercise reportCid Archive
+
+        -- Create the approved record
+        create ApprovedExpense with
+          employee
+          manager
+          finance
+          title = "Approved expense"
+          totalAmount = approvedTotal
+
+test_expense : Script ()
+test_expense = do
+  emp <- allocateParty "Employee"
+  mgr <- allocateParty "Manager"
+  fin <- allocateParty "Finance"
+
+  -- Employee submits an expense report
+  reportCid <- submit emp do
+    createCmd ExpenseReport with
+      employee = emp
+      manager = mgr
+      finance = fin
+      title = "Q1 Travel"
+      items =
+        [ LineItem "Flight" 450.0 Travel
+        , LineItem "Hotel" 320.0 Travel
+        , LineItem "Dinner" 85.0 Meals
+        ]
+      status = Pending
+      notes = ""
+
+  -- Manager requests more info
+  reportCid <- submit mgr do
+    exerciseCmd reportCid RequestInfo with
+      question = "Was the dinner client-facing?"
+
+  -- Employee responds
+  reportCid <- submit emp do
+    exerciseCmd reportCid ProvideInfo with
+      response = "Yes, dinner with client ABC Corp"
+
+  -- Manager approves
+  reportCid <- submit mgr do
+    exerciseCmd reportCid Approve
+
+  -- Verify the report is now Approved
+  Some report <- queryContractId emp reportCid
+  assertMsg "Should be Approved"
+    (report.status == Approved)
+
+  pure ()
+
+test_rejection : Script ()
+test_rejection = do
+  emp <- allocateParty "Employee"
+  mgr <- allocateParty "Manager"
+  fin <- allocateParty "Finance"
+
+  reportCid <- submit emp do
+    createCmd ExpenseReport with
+      employee = emp
+      manager = mgr
+      finance = fin
+      title = "Gaming Setup"
+      items =
+        [ LineItem "PS5" 499.0 Equipment ]
+      status = Pending
+      notes = ""
+
+  -- Manager rejects
+  reportCid <- submit mgr do
+    exerciseCmd reportCid Reject with
+      reason = "Not a business expense"
+
+  -- Verify rejection
+  Some report <- queryContractId emp reportCid
+  assertMsg "Should be Rejected"
+    (report.status == Rejected)
+
+  -- Cannot approve a rejected report
+  submitMustFail mgr do
+    exerciseCmd reportCid Approve
+
+  pure ()
+
+test_nonconsuming : Script ()
+test_nonconsuming = do
+  emp <- allocateParty "Employee"
+  mgr <- allocateParty "Manager"
+  fin <- allocateParty "Finance"
+
+  reportCid <- submit emp do
+    createCmd ExpenseReport with
+      employee = emp
+      manager = mgr
+      finance = fin
+      title = "Office Supplies"
+      items =
+        [ LineItem "Notebooks" 25.0 Other
+        , LineItem "Pens" 15.0 Other
+        ]
+      status = Pending
+      notes = ""
+
+  -- GetTotal is nonconsuming: can call it twice
+  total1 <- submit emp do
+    exerciseCmd reportCid GetTotal
+  total2 <- submit emp do
+    exerciseCmd reportCid GetTotal
+  assertMsg "Totals should match" (total1 == total2)
+  assertMsg "Total should be 40" (total1 == 40.0)
+
+  pure ()

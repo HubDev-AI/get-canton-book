@@ -1,0 +1,53 @@
+module Asset where
+
+template Asset
+  with
+    issuer   : Party
+    owner    : Party
+    symbol   : Text
+    quantity : Decimal
+    observers : [Party]
+  where
+    signatory issuer, owner
+    observer observers
+    ensure quantity > 0.0
+
+    choice Split
+      : (ContractId Asset, ContractId Asset)
+      with splitQuantity : Decimal
+      controller owner
+      do
+        assertMsg "Split qty must be positive"
+          (splitQuantity > 0.0)
+        assertMsg "Split qty must be less than total"
+          (splitQuantity < quantity)
+        cid1 <- create this with
+          quantity = splitQuantity
+        cid2 <- create this with
+          quantity = quantity - splitQuantity
+        return (cid1, cid2)
+
+    choice Merge : ContractId Asset
+      with otherCid : ContractId Asset
+      controller owner
+      do
+        other <- fetch otherCid
+        assertMsg "Issuer mismatch"
+          (other.issuer == issuer)
+        assertMsg "Owner mismatch"
+          (other.owner == owner)
+        assertMsg "Symbol mismatch"
+          (other.symbol == symbol)
+        archive otherCid
+        create this with
+          quantity = quantity + other.quantity
+
+    choice Transfer : ContractId Asset
+      with newOwner : Party
+      controller owner, newOwner
+      do
+        assertMsg "New owner must differ"
+          (newOwner /= owner)
+        create this with
+          owner = newOwner
+          observers = []

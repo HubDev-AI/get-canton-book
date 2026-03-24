@@ -1,0 +1,75 @@
+module Main.License where
+
+import DA.Time
+import DA.Date
+import Main.Types
+
+template License
+  with
+    vendor    : Party
+    customer  : Party
+    product   : Text
+    issuedAt  : Time
+    expiresAt : Time
+  where
+    signatory vendor
+    observer customer
+    ensure expiresAt > issuedAt
+
+    -- Renew: extend the expiration date
+    choice Renew : ContractId License
+      with
+        newExpiry : Time
+      controller vendor
+      do
+        now <- getTime
+        assertMsg "New expiry must be future"
+          (newExpiry > now)
+        assertMsg "Cannot shorten license"
+          (newExpiry > expiresAt)
+        create this with
+          expiresAt = newExpiry
+
+    -- Revoke: vendor cancels the license
+    choice Revoke : ()
+      controller vendor
+      do
+        return ()
+
+    -- RequestRenewal: customer asks vendor
+    nonconsuming choice RequestRenewal
+      : ContractId RenewalRequest
+      with
+        requestedExpiry : Time
+        reason : Text
+      controller customer
+      do
+        create RenewalRequest with
+          licenseCid = self
+          vendor
+          customer
+          requestedExpiry
+          reason
+
+template RenewalRequest
+  with
+    licenseCid      : ContractId License
+    vendor          : Party
+    customer        : Party
+    requestedExpiry : Time
+    reason          : Text
+  where
+    signatory customer
+    observer vendor
+
+    choice ApproveRenewal
+      : ContractId License
+      controller vendor
+      do
+        exercise licenseCid Renew with
+          newExpiry = requestedExpiry
+
+    choice RejectRenewal : ()
+      controller vendor
+      do
+        return ()

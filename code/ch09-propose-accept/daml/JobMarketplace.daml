@@ -1,0 +1,410 @@
+module JobMarketplace where
+
+import Daml.Script
+import DA.List (head)
+
+data JobType
+  = FullTime
+  | PartTime
+  | Contract
+    deriving (Eq, Show)
+
+data OfferTerms = OfferTerms with
+    salary : Decimal
+    jobType : JobType
+    startDate : Text
+    notes : Optional Text
+  deriving (Eq, Show)
+
+template JobPosting
+  with
+    employer : Party
+    title : Text
+    description : Text
+    jobType : JobType
+    salaryRange : (Decimal, Decimal)
+    candidates : [Party]
+  where
+    signatory employer
+    observer candidates
+
+    ensure fst salaryRange <= snd salaryRange
+      && fst salaryRange > 0.0
+
+    -- Employer can add visible candidates
+    nonconsuming choice AddCandidate
+      : ContractId JobPosting
+      with
+        candidate : Party
+      controller employer
+      do
+        assertMsg "Already a candidate"
+          (notElem candidate candidates)
+        archive self
+        create this with
+          candidates = candidate :: candidates
+
+    -- Employer closes the posting
+    choice ClosePosting : ()
+      controller employer
+      do pure ()
+
+template Application
+  with
+    candidate : Party
+    employer : Party
+    jobTitle : Text
+    coverLetter : Text
+    experience : Int
+  where
+    signatory candidate
+    observer employer
+
+    -- Employer accepts the application
+    -- (moves candidate to interview stage)
+    choice Shortlist
+      : ContractId ShortlistedCandidate
+      controller employer
+      do
+        create ShortlistedCandidate with
+          employer
+          candidate
+          jobTitle
+          experience
+
+    -- Employer rejects
+    choice RejectApplication : ()
+      with
+        reason : Text
+      controller employer
+      do pure ()
+
+    -- Candidate withdraws
+    choice WithdrawApplication : ()
+      controller candidate
+      do pure ()
+
+template ShortlistedCandidate
+  with
+    employer : Party
+    candidate : Party
+    jobTitle : Text
+    experience : Int
+  where
+    signatory employer
+    observer candidate
+
+    -- Employer makes a formal offer
+    choice MakeOffer : ContractId JobOffer
+      with
+        terms : OfferTerms
+      controller employer
+      do
+        create JobOffer with
+          employer
+          candidate
+          jobTitle
+          terms
+
+    -- Employer decides not to proceed
+    choice PassOnCandidate : ()
+      controller employer
+      do pure ()
+
+template JobOffer
+  with
+    employer : Party
+    candidate : Party
+    jobTitle : Text
+    terms : OfferTerms
+  where
+    signatory employer
+    observer candidate
+
+    ensure terms.salary > 0.0
+
+    -- Candidate accepts: creates Employment contract
+    choice AcceptOffer : ContractId Employment
+      controller candidate
+      do
+        create Employment with
+          employer
+          employee = candidate
+          jobTitle
+          terms
+
+    -- Candidate declines
+    choice DeclineOffer : ()
+      controller candidate
+      do pure ()
+
+    -- Candidate negotiates (counter-propose)
+    choice NegotiateOffer
+      : ContractId JobOffer
+      with
+        counterSalary : Decimal
+        counterNotes : Text
+      controller candidate
+      do
+        -- Archive the current offer, create a new one
+        -- with updated terms. Now the employer is the
+        -- observer and must accept the counter.
+        create CounterOffer with
+          employer
+          candidate
+          jobTitle
+          originalTerms = terms
+          counterSalary
+          counterNotes
+        -- The old offer is consumed (archived)
+        -- Return value is the CounterOffer CID
+        -- but we declared JobOffer return type,
+        -- so we adjust the flow:
+        create JobOffer with
+          employer
+          candidate
+          jobTitle
+          terms = terms with
+            salary = counterSalary
+            notes = Some counterNotes
+
+    -- Employer withdraws the offer
+    choice WithdrawOffer : ()
+      controller employer
+      do pure ()
+
+-- Counter-offer record (for audit trail)
+template CounterOffer
+  with
+    employer : Party
+    candidate : Party
+    jobTitle : Text
+    originalTerms : OfferTerms
+    counterSalary : Decimal
+    counterNotes : Text
+  where
+    signatory candidate
+    observer employer
+
+    choice AcceptCounter : ContractId Employment
+      controller employer
+      do
+        create Employment with
+          employer
+          employee = candidate
+          jobTitle
+          terms = originalTerms with
+            salary = counterSalary
+            notes = Some counterNotes
+
+    choice RejectCounter : ()
+      controller employer
+      do pure ()
+
+template Employment
+  with
+    employer : Party
+    employee : Party
+    jobTitle : Text
+    terms : OfferTerms
+  where
+    signatory employer, employee
+
+    -- Either party can initiate termination
+    -- (but both signatures mean both agreed
+    -- to the employment in the first place)
+    choice Terminate : ()
+      with
+        reason : Text
+        initiator : Party
+      controller initiator
+      do
+        assertMsg "Must be employer or employee"
+          (initiator == employer
+            || initiator == employee)
+        pure ()
+
+-- Variation: Propose-with-Expiry
+template TimedOffer
+  with
+    employer : Party
+    candidate : Party
+    terms : OfferTerms
+    expiryDate : Text
+  where
+    signatory employer
+    observer candidate
+
+    choice AcceptTimedOffer
+      : ContractId Employment
+      with
+        acceptDate : Text
+      controller candidate
+      do
+        assertMsg "Offer has expired"
+          (acceptDate <= expiryDate)
+        create Employment with
+          employer
+          employee = candidate
+          jobTitle = "Timed position"
+          terms
+
+    choice ExpireOffer : ()
+      controller employer
+      do pure ()
+
+test_full_workflow : Script ()
+test_full_workflow = do
+  acme <- allocateParty "Acme Corp"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  -- Employer posts a job
+  jobCid <- submit acme do
+    createCmd JobPosting with
+      employer = acme
+      title = "Senior Engineer"
+      description = "Build Daml applications"
+      jobType = FullTime
+      salaryRange = (100000.0, 150000.0)
+      candidates = [alice, bob]
+
+  -- Alice applies
+  appAlice <- submit alice do
+    createCmd Application with
+      candidate = alice
+      employer = acme
+      jobTitle = "Senior Engineer"
+      coverLetter = "Experienced Daml developer"
+      experience = 5
+
+  -- Bob applies
+  appBob <- submit bob do
+    createCmd Application with
+      candidate = bob
+      employer = acme
+      jobTitle = "Senior Engineer"
+      coverLetter = "Blockchain enthusiast"
+      experience = 3
+
+  -- Employer shortlists Alice, rejects Bob
+  shortAlice <- submit acme do
+    exerciseCmd appAlice Shortlist
+
+  submit acme do
+    exerciseCmd appBob RejectApplication with
+      reason = "Insufficient experience"
+
+  -- Employer makes Alice an offer
+  offerCid <- submit acme do
+    exerciseCmd shortAlice MakeOffer with
+      terms = OfferTerms with
+        salary = 120000.0
+        jobType = FullTime
+        startDate = "2026-04-01"
+        notes = None
+
+  -- Alice negotiates
+  counterCid <- submit alice do
+    exerciseCmd offerCid NegotiateOffer with
+      counterSalary = 135000.0
+      counterNotes = "Requesting market rate"
+
+  -- Verify the counter-offer exists
+  counters <- query @CounterOffer acme
+  assertMsg "Should have a counter-offer"
+    (not (null counters))
+
+  -- Employer accepts the counter-offer
+  let (counterOfferCid, _) = DA.List.head counters
+  emplCid <- submit acme do
+    exerciseCmd counterOfferCid AcceptCounter
+
+  -- Verify employment contract exists
+  Some empl <- queryContractId acme emplCid
+  assertMsg "Salary should be 135000"
+    (empl.terms.salary == 135000.0)
+  assertMsg "Both parties are signatories"
+    (empl.employer == acme
+      && empl.employee == alice)
+
+  pure ()
+
+test_withdrawal : Script ()
+test_withdrawal = do
+  acme <- allocateParty "Acme Corp"
+  alice <- allocateParty "Alice"
+
+  -- Alice applies
+  appCid <- submit alice do
+    createCmd Application with
+      candidate = alice
+      employer = acme
+      jobTitle = "Engineer"
+      coverLetter = "Interested in the role"
+      experience = 2
+
+  -- Alice changes her mind and withdraws
+  submit alice do
+    exerciseCmd appCid WithdrawApplication
+
+  -- The application is archived: employer
+  -- can no longer act on it
+  submitMustFail acme do
+    exerciseCmd appCid Shortlist
+
+  pure ()
+
+test_offer_decline : Script ()
+test_offer_decline = do
+  acme <- allocateParty "Acme Corp"
+  bob <- allocateParty "Bob"
+
+  -- Skip straight to an offer for brevity
+  offerCid <- submit acme do
+    createCmd JobOffer with
+      employer = acme
+      candidate = bob
+      jobTitle = "Junior Dev"
+      terms = OfferTerms with
+        salary = 70000.0
+        jobType = FullTime
+        startDate = "2026-05-01"
+        notes = Some "Entry-level position"
+
+  -- Bob declines
+  submit bob do
+    exerciseCmd offerCid DeclineOffer
+
+  -- Offer is archived
+  result <- queryContractId @JobOffer acme offerCid
+  assertMsg "Offer should be archived"
+    (result == None)
+
+  pure ()
+
+test_employer_withdraw : Script ()
+test_employer_withdraw = do
+  acme <- allocateParty "Acme Corp"
+  charlie <- allocateParty "Charlie"
+
+  offerCid <- submit acme do
+    createCmd JobOffer with
+      employer = acme
+      candidate = charlie
+      jobTitle = "Intern"
+      terms = OfferTerms with
+        salary = 40000.0
+        jobType = Contract
+        startDate = "2026-06-01"
+        notes = None
+
+  -- Employer withdraws before candidate responds
+  submit acme do
+    exerciseCmd offerCid WithdrawOffer
+
+  -- Charlie can no longer accept
+  submitMustFail charlie do
+    exerciseCmd offerCid AcceptOffer
+
+  pure ()

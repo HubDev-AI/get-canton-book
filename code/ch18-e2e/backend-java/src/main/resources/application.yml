@@ -1,0 +1,10 @@
+# application.yml
+ledger:
+  api-url: http://localhost:3975
+keycloak:
+  url: http://keycloak.localhost:8082
+  realm: AppProvider
+  client-id: app-provider-validator
+  client-secret: ${CLIENT_SECRET}
+server:
+  port: 8080

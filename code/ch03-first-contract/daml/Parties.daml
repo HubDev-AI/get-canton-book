@@ -1,0 +1,207 @@
+module Parties where
+
+import Daml.Script
+import DA.Time
+
+data Cash = Cash with
+  currency : Text
+  amount : Decimal
+    deriving (Eq, Show)
+
+template SimpleIou
+  with
+    issuer : Party
+    owner : Party
+    cash : Cash
+  where
+    signatory issuer
+
+simple_iou_test = do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  -- Alice creates an IOU promising Bob 100 USD.
+  iou <- submit alice do
+    createCmd SimpleIou with
+      issuer = alice
+      owner = bob
+      cash = Cash with amount = 100.0, currency = "USD"
+
+  passTime (days 1)
+  -- Bob delivers the goods, trusting Alice's IOU.
+
+  passTime (minutes 10)
+  -- Alice just deletes the payment.
+  submit alice do
+    archiveCmd iou
+
+template Iou
+  with
+    issuer : Party
+    owner : Party
+    cash : Cash
+  where
+    signatory issuer, owner
+
+    choice Transfer
+      : ContractId Iou
+      with
+        newOwner : Party
+      controller owner
+      do
+        assertMsg "newOwner cannot be equal to owner."
+          (owner /= newOwner)
+        create this with owner = newOwner
+
+    choice ProposeTransfer
+      : ContractId IouTransferProposal
+      with
+        newOwner : Party
+      controller owner
+      do
+        assertMsg "newOwner cannot be equal to owner."
+          (owner /= newOwner)
+        create IouTransferProposal with
+          iou = this
+          newOwner
+
+    choice Mutual_Transfer
+      : ContractId Iou
+      with
+        newOwner : Party
+      controller owner, newOwner
+      do
+        assertMsg "newOwner cannot be equal to owner."
+          (owner /= newOwner)
+        create this with owner = newOwner
+
+iou_test = do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  -- Alice can't create an Iou with Bob as signatory.
+  -- Bob hasn't agreed to anything yet.
+  submitMustFail alice do
+    createCmd Iou with
+      issuer = alice
+      owner = bob
+      cash = Cash with amount = 100.0, currency = "USD"
+
+  -- She can issue one to herself (she's both signatories).
+  iou <- submit alice do
+    createCmd Iou with
+      issuer = alice
+      owner = alice
+      cash = Cash with amount = 100.0, currency = "USD"
+
+  -- But she can't transfer it to Bob either.
+  submitMustFail alice do
+    exerciseCmd iou Transfer with newOwner = bob
+
+template IouProposal
+  with
+    iou : Iou
+  where
+    signatory iou.issuer
+    observer iou.owner
+
+    choice IouProposal_Accept
+        : ContractId Iou
+        controller iou.owner
+        do
+          create iou
+
+template IouTransferProposal
+  with
+    iou : Iou
+    newOwner : Party
+  where
+    signatory (signatory iou)
+    observer (observer iou), newOwner
+
+    choice IouTransferProposal_Cancel
+      : ContractId Iou
+      controller iou.owner
+      do create iou
+
+    choice IouTransferProposal_Reject
+      : ContractId Iou
+      controller newOwner
+      do create iou
+
+    choice IouTransferProposal_Accept
+      : ContractId Iou
+      controller newOwner
+      do
+        create iou with owner = newOwner
+
+proposal_test = do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  iouProposal <- submit alice do
+    createCmd IouProposal with
+      iou = Iou with
+        issuer = alice
+        owner = bob
+        cash = Cash with amount = 100.0, currency = "USD"
+
+  submit bob do
+    exerciseCmd iouProposal IouProposal_Accept
+
+template IouSender
+  with
+    sender : Party
+    receiver : Party
+  where
+    signatory receiver
+    observer sender
+
+    nonconsuming choice Send_Iou
+      : ContractId Iou
+      with
+        iouCid : ContractId Iou
+      controller sender
+      do
+        iou <- fetch iouCid
+        assert (iou.cash.amount > 0.0)
+        assert (sender == iou.owner)
+        exercise iouCid Mutual_Transfer with
+          newOwner = receiver
+
+template NonTransitive
+  with
+    partyA : Party
+    partyB : Party
+  where
+    signatory partyA
+    observer partyB
+
+    choice TryA
+      : ContractId NonTransitive
+      controller partyA
+      do
+        create NonTransitive with
+          partyA = partyB
+          partyB = partyA
+
+    choice TryB
+      : ContractId NonTransitive
+        with
+          other : ContractId NonTransitive
+      controller partyB
+      do
+        exercise other TryA
+
+non_transitive_test = do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  nt1 <- submit alice do
+    createCmd NonTransitive with partyA = alice, partyB = bob
+  nt2 <- submit alice do
+    createCmd NonTransitive with partyA = alice, partyB = bob
+
+  -- This fails! Bob cannot use Alice's authority transitively.
+  submitMustFail bob do
+    exerciseCmd nt1 TryB with other = nt2
