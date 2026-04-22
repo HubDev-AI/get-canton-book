@@ -1,0 +1,130 @@
+module Factoring where
+
+import Invoice
+import Payment
+
+-- | Lifecycle of a factoring agreement.
+data AgreementStatus
+  = Active
+  | Settled
+  | Defaulted
+  deriving (Eq, Show)
+
+-- | A factor offers to buy a confirmed invoice at a discount.
+--
+-- The offer is visible to the supplier, who can accept or reject.
+-- The factor can withdraw while the offer is still open.
+template FactoringOffer
+  with
+    factor : Party
+    supplier : Party
+    buyer : Party
+    invoiceCid : ContractId Invoice
+    invoiceNumber : Text
+    originalAmount : Decimal
+    currency : Text
+    dueDate : Time
+    discountRate : Decimal  -- 0.05 = 5% discount
+  where
+    signatory factor
+    observer supplier
+
+    ensure discountRate > 0.0 && discountRate < 1.0
+        && originalAmount > 0.0
+
+    -- | Supplier accepts the offer.
+    -- Archives the original invoice and creates the
+    -- factoring agreement.
+    choice AcceptOffer : ContractId FactoringAgreement
+      controller supplier
+      do
+        invoice <- fetch invoiceCid
+        assertMsg "Invoice must be Confirmed"
+          (invoice.status == Confirmed)
+        assertMsg "Offer does not match invoice"
+          (invoice.invoiceNumber == invoiceNumber
+            && invoice.supplier == supplier
+            && invoice.buyer == buyer)
+
+        archive invoiceCid
+
+        let advance = originalAmount * (1.0 - discountRate)
+        create FactoringAgreement with
+          supplier
+          factor
+          buyer
+          invoiceNumber
+          originalAmount
+          advanceAmount = advance
+          currency
+          dueDate
+          status = Active
+
+    -- | Supplier rejects the offer.
+    choice RejectOffer : ()
+      controller supplier
+      do pure ()
+
+    -- | Factor withdraws an open offer.
+    choice WithdrawOffer : ()
+      controller factor
+      do pure ()
+
+
+-- | A three-party agreement recording that the factor
+-- has purchased the supplier's right to be paid.
+template FactoringAgreement
+  with
+    supplier : Party
+    factor : Party
+    buyer : Party
+    invoiceNumber : Text
+    originalAmount : Decimal    -- face value owed by buyer
+    advanceAmount : Decimal     -- what factor paid supplier
+    currency : Text
+    dueDate : Time
+    status : AgreementStatus
+  where
+    signatory supplier, factor
+    observer buyer
+
+    ensure originalAmount > 0.0
+        && advanceAmount > 0.0
+        && advanceAmount < originalAmount
+
+    -- | Buyer settles by paying the factor.
+    -- Kept for Chapter 7 --- atomic settlement lives
+    -- in SettleWithToken below (Chapter 8).
+    choice SettleByBuyer : ContractId FactoringAgreement
+      controller buyer
+      do
+        assertMsg "Agreement is not active" (status == Active)
+        create this with status = Settled
+
+    -- | Atomic delivery-vs-payment: transfer a
+    -- PaymentToken of the right amount from buyer to
+    -- factor and mark the agreement Settled, all in
+    -- one transaction.
+    choice SettleWithToken : ContractId FactoringAgreement
+      with tokenCid : ContractId PaymentToken
+      controller buyer
+      do
+        assertMsg "Agreement is not active"
+          (status == Active)
+        token <- fetch tokenCid
+        assertMsg "Token owner must be buyer"
+          (token.owner == buyer)
+        assertMsg "Token amount mismatch"
+          (token.amount == originalAmount)
+        assertMsg "Token currency mismatch"
+          (token.currency == currency)
+        _ <- exercise tokenCid Transfer with
+          newOwner = factor
+        create this with status = Settled
+
+    -- | Factor records default after due date.
+    choice MarkDefaulted : ContractId FactoringAgreement
+      controller factor
+      do
+        assertMsg "Agreement is not active" (status == Active)
+        create this with status = Defaulted

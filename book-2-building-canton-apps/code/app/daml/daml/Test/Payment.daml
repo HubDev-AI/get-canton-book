@@ -1,0 +1,150 @@
+module Test.Payment where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+import DA.Time (time)
+import DA.Assert ((===))
+
+import Invoice
+import Factoring
+import Payment
+
+-- | Issue -> transfer -> verify new owner.
+testTokenTransfer : Script ()
+testTokenTransfer = do
+  issuer <- allocateParty "Bank"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  tokenCid <- submit issuer do
+    createCmd PaymentToken with
+      issuer
+      owner = alice
+      amount = 1000.00
+      currency = "USD"
+
+  newCid <- submit (actAs [alice, bob]) do
+    exerciseCmd tokenCid Transfer with newOwner = bob
+
+  Some token <- queryContractId bob newCid
+  token.owner === bob
+  token.amount === 1000.00
+
+-- | ensure rejects bad currency length.
+testTokenEnsure : Script ()
+testTokenEnsure = do
+  issuer <- allocateParty "Bank"
+  alice <- allocateParty "Alice"
+  submitMustFail issuer do
+    createCmd PaymentToken with
+      issuer
+      owner = alice
+      amount = 1000.00
+      currency = "DOLLAR"
+
+-- | Full DvP: buyer settles factoring agreement by
+-- transferring a PaymentToken to the factor atomically.
+testDvP : Script ()
+testDvP = do
+  issuer <- allocateParty "Bank"
+  supplier <- allocateParty "Supplier"
+  buyer <- allocateParty "Buyer"
+  factor <- allocateParty "Factor"
+  let due = time (date 2026 Dec 31) 0 0 0
+
+  -- Invoice lifecycle
+  draft <- submit supplier do
+    createCmd Invoice with
+      supplier
+      buyer
+      invoiceNumber = "INV-200"
+      amount = 10000.00
+      currency = "USD"
+      dueDate = due
+      status = Draft
+  confirmed <- submit buyer do
+    exerciseCmd draft Confirm
+
+  -- Factoring offer + accept
+  offer <- submit factor do
+    createCmd FactoringOffer with
+      factor
+      supplier
+      buyer
+      invoiceCid = confirmed
+      invoiceNumber = "INV-200"
+      originalAmount = 10000.00
+      currency = "USD"
+      dueDate = due
+      discountRate = 0.05
+  fagr <- submit supplier do
+    exerciseCmd offer AcceptOffer
+
+  -- Bank issues a token to the buyer for the full amount
+  token <- submit issuer do
+    createCmd PaymentToken with
+      issuer
+      owner = buyer
+      amount = 10000.00
+      currency = "USD"
+
+  -- Atomic: buyer settles + token moves to factor
+  settled <- submit (actAs [buyer, factor]) do
+    exerciseCmd fagr SettleWithToken with
+      tokenCid = token
+
+  -- Agreement is Settled
+  Some fa <- queryContractId factor settled
+  fa.status === Settled
+
+  -- Factor now holds a token for the full amount
+  tokens <- query @PaymentToken factor
+  let factorTokens =
+        filter (\(_, t) -> t.owner == factor) tokens
+  length factorTokens === 1
+
+-- | Wrong-amount token is rejected.
+testDvPWrongAmount : Script ()
+testDvPWrongAmount = do
+  issuer <- allocateParty "Bank"
+  supplier <- allocateParty "Supplier"
+  buyer <- allocateParty "Buyer"
+  factor <- allocateParty "Factor"
+  let due = time (date 2026 Dec 31) 0 0 0
+
+  draft <- submit supplier do
+    createCmd Invoice with
+      supplier
+      buyer
+      invoiceNumber = "INV-201"
+      amount = 5000.00
+      currency = "USD"
+      dueDate = due
+      status = Draft
+  confirmed <- submit buyer do
+    exerciseCmd draft Confirm
+  offer <- submit factor do
+    createCmd FactoringOffer with
+      factor
+      supplier
+      buyer
+      invoiceCid = confirmed
+      invoiceNumber = "INV-201"
+      originalAmount = 5000.00
+      currency = "USD"
+      dueDate = due
+      discountRate = 0.05
+  fagr <- submit supplier do
+    exerciseCmd offer AcceptOffer
+
+  -- Token is too small
+  token <- submit issuer do
+    createCmd PaymentToken with
+      issuer
+      owner = buyer
+      amount = 3000.00
+      currency = "USD"
+
+  submitMustFail (actAs [buyer, factor]) do
+    exerciseCmd fagr SettleWithToken with
+      tokenCid = token

@@ -1,0 +1,56 @@
+module Invoice where
+
+import DA.Text qualified as T
+
+-- | Lifecycle state of an Invoice. Extended in Chapter 7 with Factored.
+data InvoiceStatus
+  = Draft
+  | Confirmed
+  | Paid
+  deriving (Eq, Show)
+
+-- | A commercial invoice raised by a supplier against a buyer.
+--
+-- An Invoice is created in 'Draft', moves to 'Confirmed' once the
+-- buyer acknowledges the debt, and finally to 'Paid' when the buyer
+-- settles it. The supplier may Cancel while still in 'Draft'.
+template Invoice
+  with
+    supplier : Party
+    buyer : Party
+    invoiceNumber : Text
+    amount : Decimal
+    currency : Text
+    dueDate : Time
+    status : InvoiceStatus
+  where
+    signatory supplier
+    observer buyer
+
+    ensure amount > 0.0
+        && T.length invoiceNumber > 0
+        && T.length currency == 3
+
+    -- | Buyer accepts the invoice and promises to pay.
+    choice Confirm : ContractId Invoice
+      controller buyer
+      do
+        assertMsg "Only a Draft invoice can be confirmed"
+          (status == Draft)
+        create this with status = Confirmed
+
+    -- | Buyer settles the invoice on or after the due date.
+    choice Pay : ContractId Invoice
+      controller buyer
+      do
+        assertMsg "Only a Confirmed invoice can be paid"
+          (status == Confirmed)
+        create this with status = Paid
+
+    -- | Supplier withdraws a Draft invoice.
+    choice Cancel : ()
+      controller supplier
+      do
+        assertMsg "Only a Draft invoice can be cancelled"
+          (status == Draft)
+        pure ()
