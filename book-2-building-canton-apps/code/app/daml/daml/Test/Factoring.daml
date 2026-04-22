@@ -1,0 +1,175 @@
+module Test.Factoring where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+import DA.Time (time)
+import DA.Assert ((===))
+
+import Invoice
+import Factoring
+
+-- NOTE: `agreement` is a reserved keyword in Daml (the legacy
+-- agreement clause on templates), so local bindings use `fagr`.
+
+-- | Helper: set up supplier, buyer, factor with a Confirmed invoice.
+setupConfirmed : Script (Party, Party, Party, ContractId Invoice)
+setupConfirmed = do
+  supplier <- allocateParty "Supplier"
+  buyer <- allocateParty "Buyer"
+  factor <- allocateParty "Factor"
+  let due = time (date 2026 Dec 31) 0 0 0
+  draft <- submit supplier do
+    createCmd Invoice with
+      supplier
+      buyer
+      invoiceNumber = "INV-100"
+      amount = 10000.00
+      currency = "USD"
+      dueDate = due
+      status = Draft
+  confirmed <- submit buyer do
+    exerciseCmd draft Confirm
+  pure (supplier, buyer, factor, confirmed)
+
+-- | Happy path: offer -> accept -> settle.
+testFactorAcceptSettle : Script ()
+testFactorAcceptSettle = do
+  setup <- setupConfirmed
+  let (supplier, buyer, factor, invoice) = setup
+  let due = time (date 2026 Dec 31) 0 0 0
+
+  offer <- submit factor do
+    createCmd FactoringOffer with
+      factor
+      supplier
+      buyer
+      invoiceCid = invoice
+      invoiceNumber = "INV-100"
+      originalAmount = 10000.00
+      currency = "USD"
+      dueDate = due
+      discountRate = 0.05
+
+  fagr <- submit supplier do
+    exerciseCmd offer AcceptOffer
+
+  settled <- submit buyer do
+    exerciseCmd fagr SettleByBuyer
+
+  Some fa <- queryContractId factor settled
+  fa.status === Settled
+  fa.advanceAmount === 9500.00
+
+-- | Supplier can reject an offer; invoice remains Confirmed.
+testFactorRejected : Script ()
+testFactorRejected = do
+  setup <- setupConfirmed
+  let (supplier, buyer, factor, invoice) = setup
+  let due = time (date 2026 Dec 31) 0 0 0
+  offer <- submit factor do
+    createCmd FactoringOffer with
+      factor
+      supplier
+      buyer
+      invoiceCid = invoice
+      invoiceNumber = "INV-100"
+      originalAmount = 10000.00
+      currency = "USD"
+      dueDate = due
+      discountRate = 0.10
+  submit supplier do
+    exerciseCmd offer RejectOffer
+  Some inv <- queryContractId supplier invoice
+  inv.status === Confirmed
+
+-- | Factor can withdraw an offer.
+testFactorWithdraw : Script ()
+testFactorWithdraw = do
+  setup <- setupConfirmed
+  let (supplier, buyer, factor, invoice) = setup
+  let due = time (date 2026 Dec 31) 0 0 0
+  offer <- submit factor do
+    createCmd FactoringOffer with
+      factor
+      supplier
+      buyer
+      invoiceCid = invoice
+      invoiceNumber = "INV-100"
+      originalAmount = 10000.00
+      currency = "USD"
+      dueDate = due
+      discountRate = 0.08
+  submit factor do
+    exerciseCmd offer WithdrawOffer
+
+-- | ensure rejects a zero discount.
+testBadDiscount : Script ()
+testBadDiscount = do
+  setup <- setupConfirmed
+  let (supplier, buyer, factor, invoice) = setup
+  let due = time (date 2026 Dec 31) 0 0 0
+  submitMustFail factor do
+    createCmd FactoringOffer with
+      factor
+      supplier
+      buyer
+      invoiceCid = invoice
+      invoiceNumber = "INV-100"
+      originalAmount = 10000.00
+      currency = "USD"
+      dueDate = due
+      discountRate = 0.0
+
+-- | Cannot accept a Draft invoice.
+testAcceptRequiresConfirmed : Script ()
+testAcceptRequiresConfirmed = do
+  supplier <- allocateParty "Supplier"
+  buyer <- allocateParty "Buyer"
+  factor <- allocateParty "Factor"
+  let due = time (date 2026 Dec 31) 0 0 0
+  draft <- submit supplier do
+    createCmd Invoice with
+      supplier
+      buyer
+      invoiceNumber = "INV-101"
+      amount = 5000.00
+      currency = "USD"
+      dueDate = due
+      status = Draft
+  offer <- submit factor do
+    createCmd FactoringOffer with
+      factor
+      supplier
+      buyer
+      invoiceCid = draft
+      invoiceNumber = "INV-101"
+      originalAmount = 5000.00
+      currency = "USD"
+      dueDate = due
+      discountRate = 0.05
+  submitMustFail supplier do
+    exerciseCmd offer AcceptOffer
+
+-- | Factor can mark defaulted after accepting.
+testMarkDefaulted : Script ()
+testMarkDefaulted = do
+  setup <- setupConfirmed
+  let (supplier, buyer, factor, invoice) = setup
+  let due = time (date 2026 Dec 31) 0 0 0
+  offer <- submit factor do
+    createCmd FactoringOffer with
+      factor
+      supplier
+      buyer
+      invoiceCid = invoice
+      invoiceNumber = "INV-100"
+      originalAmount = 10000.00
+      currency = "USD"
+      dueDate = due
+      discountRate = 0.05
+  fagr <- submit supplier do
+    exerciseCmd offer AcceptOffer
+  defaulted <- submit factor do
+    exerciseCmd fagr MarkDefaulted
+  Some fa <- queryContractId factor defaulted
+  fa.status === Defaulted

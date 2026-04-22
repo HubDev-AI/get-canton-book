@@ -1,0 +1,90 @@
+module Test.Invoice where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+import DA.Time (time)
+import DA.Assert ((===))
+
+import Invoice
+
+-- | Happy path: create → confirm → pay.
+testHappyPath : Script ()
+testHappyPath = do
+  supplier <- allocateParty "Supplier"
+  buyer <- allocateParty "Buyer"
+  let due = time (date 2026 Dec 31) 0 0 0
+
+  draftCid <- submit supplier do
+    createCmd Invoice with
+      supplier
+      buyer
+      invoiceNumber = "INV-001"
+      amount = 1000.00
+      currency = "USD"
+      dueDate = due
+      status = Draft
+
+  confirmedCid <- submit buyer do
+    exerciseCmd draftCid Confirm
+  paidCid <- submit buyer do
+    exerciseCmd confirmedCid Pay
+
+  Some paid <- queryContractId buyer paidCid
+  paid.status === Paid
+
+-- | Buyer cannot pay an invoice still in Draft.
+testPayRequiresConfirmed : Script ()
+testPayRequiresConfirmed = do
+  supplier <- allocateParty "Supplier"
+  buyer <- allocateParty "Buyer"
+  let due = time (date 2026 Dec 31) 0 0 0
+
+  draftCid <- submit supplier do
+    createCmd Invoice with
+      supplier
+      buyer
+      invoiceNumber = "INV-002"
+      amount = 500.00
+      currency = "USD"
+      dueDate = due
+      status = Draft
+
+  submitMustFail buyer do
+    exerciseCmd draftCid Pay
+
+-- | ensure rejects a zero-amount invoice.
+testEnsureAmount : Script ()
+testEnsureAmount = do
+  supplier <- allocateParty "Supplier"
+  buyer <- allocateParty "Buyer"
+  let due = time (date 2026 Dec 31) 0 0 0
+
+  submitMustFail supplier do
+    createCmd Invoice with
+      supplier
+      buyer
+      invoiceNumber = "INV-003"
+      amount = 0.00
+      currency = "USD"
+      dueDate = due
+      status = Draft
+
+-- | Supplier can cancel a Draft invoice.
+testCancel : Script ()
+testCancel = do
+  supplier <- allocateParty "Supplier"
+  buyer <- allocateParty "Buyer"
+  let due = time (date 2026 Dec 31) 0 0 0
+
+  draftCid <- submit supplier do
+    createCmd Invoice with
+      supplier
+      buyer
+      invoiceNumber = "INV-004"
+      amount = 250.00
+      currency = "USD"
+      dueDate = due
+      status = Draft
+
+  submit supplier do
+    exerciseCmd draftCid Cancel

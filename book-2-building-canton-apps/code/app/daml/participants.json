@@ -1,0 +1,16 @@
+{
+  "default_participant": {
+    "host": "localhost",
+    "port": 5011
+  },
+  "participants": {
+    "supplier": { "host": "localhost", "port": 5011 },
+    "buyer": { "host": "localhost", "port": 5021 },
+    "factor": { "host": "localhost", "port": 5031 }
+  },
+  "party_participants": {
+    "Supplier::1220f7b280be32e98fe41ec6742cdd561d56993df39d20901f2876d6a4c627381ca0": "supplier",
+    "Buyer::1220b67d78e07c7f80c39db93d91984170ab8d4588858284591056ba6c972ab64893": "buyer",
+    "Factor::1220098a44bdfe2896b9ce7e20f70bf8d2be9545a661f6daa12012ab2091ad2a95da": "factor"
+  }
+}

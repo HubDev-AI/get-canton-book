@@ -1,0 +1,54 @@
+import com.digitalasset.canton.config.RequireTypes.PositiveInt
+import com.digitalasset.canton.console.LocalParticipantReference
+
+def enableIfMissing(p: LocalParticipantReference, name: String) =
+  p.parties.list()
+    .map(_.party)
+    .find(_.toProtoPrimitive.startsWith(s"$name::"))
+    .getOrElse(p.parties.enable(name))
+
+// Bootstrap synchronizer (idempotent)
+bootstrap.synchronizer(
+  synchronizerName = "invoice-network",
+  sequencers = Seq(sequencer1),
+  mediators = Seq(mediator1),
+  synchronizerOwners = Seq(sequencer1),
+  synchronizerThreshold = PositiveInt.one,
+  staticSynchronizerParameters =
+    StaticSynchronizerParameters
+      .defaultsWithoutKMS(
+        ProtocolVersion.forSynchronizer
+      ),
+)
+
+// Connect participants
+participantSupplier.synchronizers
+  .connect_local(sequencer1, "invoice-network")
+utils.retry_until_true {
+  participantSupplier.synchronizers
+    .active("invoice-network")
+}
+
+participantBuyer.synchronizers
+  .connect_local(sequencer1, "invoice-network")
+utils.retry_until_true {
+  participantBuyer.synchronizers
+    .active("invoice-network")
+}
+
+participantFactor.synchronizers
+  .connect_local(sequencer1, "invoice-network")
+utils.retry_until_true {
+  participantFactor.synchronizers
+    .active("invoice-network")
+}
+
+// Allocate parties (idempotent across restarts)
+val supplier = enableIfMissing(participantSupplier, "Supplier")
+val buyer    = enableIfMissing(participantBuyer,    "Buyer")
+val factor   = enableIfMissing(participantFactor,   "Factor")
+
+println(s"Supplier: $supplier")
+println(s"Buyer:    $buyer")
+println(s"Factor:   $factor")
+println("Network ready!")

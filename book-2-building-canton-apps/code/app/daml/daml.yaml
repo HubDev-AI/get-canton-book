@@ -1,0 +1,8 @@
+sdk-version: 3.4.11
+name: invoice-app
+source: daml
+version: 1.3.0
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script

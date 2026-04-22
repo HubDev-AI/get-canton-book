@@ -1,0 +1,30 @@
+module Payment where
+
+import DA.Text qualified as T
+
+-- | A minimal fungible payment token.
+--
+-- Issued by a trusted issuer (a bank, an escrow agent);
+-- the owner can transfer it to another party. The issuer
+-- remains the sole signatory so the owner can be rewritten
+-- on each transfer without new consent from the issuer.
+template PaymentToken
+  with
+    issuer : Party
+    owner : Party
+    amount : Decimal
+    currency : Text
+  where
+    signatory issuer
+    observer owner
+
+    ensure amount > 0.0 && T.length currency == 3
+
+    -- | Transfer the token to a new owner.
+    -- Requires both sides to authorize the move
+    -- (propose-accept in one transaction).
+    choice Transfer : ContractId PaymentToken
+      with newOwner : Party
+      controller owner, newOwner
+      do
+        create this with owner = newOwner

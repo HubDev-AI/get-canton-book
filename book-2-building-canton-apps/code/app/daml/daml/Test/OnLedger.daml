@@ -1,0 +1,54 @@
+module Test.OnLedger where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+import DA.Time (time)
+import DA.Text qualified as T
+
+import Invoice
+
+-- | Runs against the live ledger, finds pre-existing
+-- parties (Supplier, Buyer) by PartyId prefix, and
+-- exercises a full Draft -> Confirmed -> Paid lifecycle.
+-- In the sandbox (dpm test) no such parties exist, so
+-- we fall back to allocating fresh ones with the same
+-- hint — the workflow still exercises end-to-end.
+fullWorkflow : Script ()
+fullWorkflow = do
+  parties <- listKnownParties
+  let findByPrefix pfx =
+        find
+          (\p -> T.isPrefixOf pfx (partyToText p.party))
+          parties
+  supplier <- case findByPrefix "Supplier::" of
+    Some d -> pure d.party
+    None -> allocateParty "Supplier"
+  buyer <- case findByPrefix "Buyer::" of
+    Some d -> pure d.party
+    None -> allocateParty "Buyer"
+  let due = time (date 2027 Jun 30) 0 0 0
+
+  debug ("Supplier: " <> show supplier)
+  debug ("Buyer:    " <> show buyer)
+
+  draft <- submit supplier do
+    createCmd Invoice with
+      supplier
+      buyer
+      invoiceNumber = "LIVE-001"
+      amount = 2500.00
+      currency = "USD"
+      dueDate = due
+      status = Draft
+  debug ("Created Draft: " <> show draft)
+
+  confirmed <- submit buyer do
+    exerciseCmd draft Confirm
+  debug ("Confirmed: " <> show confirmed)
+
+  paid <- submit buyer do
+    exerciseCmd confirmed Pay
+  debug ("Paid: " <> show paid)
+
+  Some final <- queryContractId buyer paid
+  debug ("Final status: " <> show final.status)
